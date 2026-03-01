@@ -2,8 +2,14 @@
 
 Simulador em linguagem C de um sistema de controle de altitude de aeronave utilizando um controlador PID discreto. Desenvolvido com foco em arquitetura estilo sistema embarcado: modular, determinístico e sem dependências externas.
 
----
 
+## Resultado da Simulação
+
+![Gráfico de simulação](simulation_result.png)
+
+> Gerado automaticamente ao rodar `./altitude_sim`. A região vermelha (t=14–16s) marca a janela de falha do sensor.
+
+---
 ## Funcionalidades
 
 - Modelo físico de voo vertical (empuxo, peso, inércia)
