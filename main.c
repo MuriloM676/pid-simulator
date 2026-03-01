@@ -31,16 +31,25 @@
 #define THRUST_MIN      0.0
 #define INITIAL_ALT     0.0
 
-#define PID_KP          120.0
-#define PID_KI          20.0
-#define PID_KD          350.0
+/* ------------------------------------------------------------------ */
+/* Ganhos adaptativos por zona de erro                                 */
+/*                                                                     */
+/* Zonas ordenadas do MENOR para o MAIOR threshold de erro:           */
+/*   SUAVE  : erro < 15m  → menos overshoot ao chegar no alvo        */
+/*   MÉDIO  : erro < 50m  → transição interpolada                     */
+/*   AGRESSIVO: erro >= 50m → subida/descida rápida                   */
+/*                                                                     */
+/* Ki é mantido constante entre zonas para não afetar o regime        */
+/* estacionário (eliminação de erro em regime permanente).            */
+/* ------------------------------------------------------------------ */
+#define PID_KI  20.0   /* Ki fixo em todas as zonas */
 
 #define SETPOINT_RATE_MAX   8.0     /* Rate limiter [m/s]              */
 #define LANDING_ALT         20.0    /* Altitude de ativação pouso [m]  */
 #define LANDING_VMAX        -2.0    /* Velocidade máx descida [m/s]    */
 
 #define CSV_PATH        "/tmp/pid_sim_data.csv"
-#define PNG_PATH        "/home/muril/pid_simulator/simulation_result.png"
+#define PNG_PATH        "simulation_result.png"
 
 /* ------------------------------------------------------------------ */
 /* Buffer de dados para o gráfico                                      */
@@ -123,16 +132,17 @@ static void update_sensor_fault(AltitudeSensor *sensor, double t)
 
 static void print_header(void)
 {
-    printf("%-8s  %-10s  %-10s  %-10s  %-10s  %-10s  %-12s  %s\n",
+    printf("%-8s  %-10s  %-10s  %-10s  %-10s  %-10s  %-12s  %-6s  %s\n",
            "Tempo(s)", "Alt_real(m)", "Alt_sensor(m)", "Veloc(m/s)",
-           "Empuxo(N)", "Erro(m)", "SP_ramp(m)", "Modo");
-    printf("%-8s  %-10s  %-10s  %-10s  %-10s  %-10s  %-12s  %s\n",
+           "Empuxo(N)", "Erro(m)", "SP_ramp(m)", "Kp", "Modo");
+    printf("%-8s  %-10s  %-10s  %-10s  %-10s  %-10s  %-12s  %-6s  %s\n",
            "--------", "----------", "-------------", "----------",
-           "----------", "----------", "------------", "----");
+           "----------", "----------", "------------", "------", "----");
 }
 
 static void print_state(double t, const AircraftState *ac,
-                        double sensor_alt, double sp_ramp)
+                        double sensor_alt, double sp_ramp,
+                        double kp_active)
 {
     double error      = sp_ramp - sensor_alt;
     const char *mode  = "NORMAL";
@@ -141,9 +151,9 @@ static void print_state(double t, const AircraftState *ac,
     else if (t >= FAULT_START && t < FAULT_END)
         mode = "FALHA_SNS";
 
-    printf("%8.2f  %10.3f  %13.3f  %10.3f  %10.2f  %10.3f  %12.3f  %s\n",
+    printf("%8.2f  %10.3f  %13.3f  %10.3f  %10.2f  %10.3f  %12.3f  %6.1f  %s\n",
            t, ac->altitude, sensor_alt, ac->velocity,
-           ac->thrust, error, sp_ramp, mode);
+           ac->thrust, error, sp_ramp, kp_active, mode);
 }
 
 /* ------------------------------------------------------------------ */
@@ -282,7 +292,30 @@ int main(void)
     sensor_init(&sensor);
 
     PIDController pid;
-    pid_init(&pid, PID_KP, PID_KI, PID_KD, THRUST_MIN, THRUST_MAX, DT);
+
+    /* Tabela de zonas de ganho adaptativo
+     * Cada entrada: { error_threshold, kp, ki, kd }
+     * Os ganhos são INTERPOLADOS entre zonas para transição suave.  */
+    /* Zonas de ganho adaptativo:
+     *
+     * Filosofia:
+     *   - Longe do alvo (erro > 40m): Kp alto + Kd moderado → subida rápida
+     *   - Perto do alvo (erro < 15m): Kp baixo + Kd muito alto → freia forte
+     *                                  antes de ultrapassar o alvo
+     *   - A interpolação suaviza a transição → sem saltos no empuxo
+     *
+     * O Kd alto na zona suave compensa o limite físico do empuxo mínimo = 0N:
+     * como não temos empuxo negativo, o amortecimento derivativo é a única
+     * forma de frear a aeronave quando ela se aproxima do alvo com velocidade
+     * positiva.                                                              */
+    static const GainZone zones[] = {
+        {  15.0,  60.0, PID_KI, 600.0 },  /* SUAVE:     erro < 15m  */
+        {  50.0,  90.0, PID_KI, 450.0 },  /* MÉDIO:     erro < 50m  */
+        { 999.0, 120.0, PID_KI, 350.0 },  /* AGRESSIVO: erro >= 50m */
+    };
+
+    pid_init(&pid, 120.0, PID_KI, 350.0, THRUST_MIN, THRUST_MAX, DT);
+    pid_set_adaptive_gains(&pid, zones, 3);
 
     printf("\n=== SIMULADOR DE CONTROLE DE ALTITUDE (PID) ===\n");
     printf("Massa: %.0f kg | Empuxo: [%.0f, %.0f] N | dt: %.0f ms\n",
@@ -343,7 +376,7 @@ int main(void)
 
         /* 10. Log no terminal a cada 100ms */
         if (print_counter == 0)
-            print_state(t, &aircraft, alt_measured, pid_sp);
+            print_state(t, &aircraft, alt_measured, pid_sp, pid.kp);
         print_counter = (print_counter + 1) % PRINT_EVERY;
     }
 

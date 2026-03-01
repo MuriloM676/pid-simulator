@@ -2,37 +2,63 @@
 #define PID_H
 
 /**
- * pid.h - Controlador PID com anti-windup e saturação de saída
+ * pid.h - Controlador PID discreto com ganhos adaptativos
  *
- * Implementa um controlador PID discreto com:
- *   - Anti-windup por clamping integral
+ * Funcionalidades:
+ *   - Anti-windup por clamping condicional
  *   - Saturação de saída (limites min/max)
- *   - Derivada aplicada sobre o erro (não sobre a saída)
+ *   - Ganhos adaptativos: Kp e Kd variam conforme a magnitude do erro
+ *     (agressivo longe do alvo, suave perto do alvo)
  */
 
+/* ------------------------------------------------------------------ */
+/* Zona de ganho adaptativo                                            */
+/* Define Kp/Ki/Kd para uma faixa de erro específica.                 */
+/* ------------------------------------------------------------------ */
 typedef struct {
-    /* Ganhos */
-    double kp;          /* Ganho proporcional */
-    double ki;          /* Ganho integral     */
-    double kd;          /* Ganho derivativo   */
+    double error_threshold; /* Erro abaixo do qual esta zona é ativada [m] */
+    double kp;
+    double ki;
+    double kd;
+} GainZone;
+
+typedef struct {
+    /* Ganhos ativos (atualizados a cada iteração pelo adaptador) */
+    double kp;
+    double ki;
+    double kd;
 
     /* Limites de saída */
-    double out_min;     /* Saída mínima (ex: empuxo mínimo) */
-    double out_max;     /* Saída máxima (ex: empuxo máximo) */
+    double out_min;
+    double out_max;
 
     /* Estado interno */
-    double integral;    /* Acumulador integral */
-    double prev_error;  /* Erro na iteração anterior (para derivada) */
+    double integral;
+    double prev_error;
+    double dt;
 
-    /* Período de amostragem */
-    double dt;          /* Intervalo de tempo [s] */
+    /* Ganhos adaptativos */
+    const GainZone *zones;      /* Tabela de zonas (ordenada do menor erro ao maior) */
+    int             zone_count; /* Número de zonas na tabela                         */
 } PIDController;
 
 /**
- * pid_init - Inicializa o controlador PID com os parâmetros fornecidos.
+ * pid_init - Inicializa o controlador com ganhos fixos (sem adaptação).
  */
 void pid_init(PIDController *pid, double kp, double ki, double kd,
               double out_min, double out_max, double dt);
+
+/**
+ * pid_set_adaptive_gains - Configura a tabela de zonas de ganho adaptativo.
+ *
+ * As zonas devem ser ordenadas do MENOR para o MAIOR error_threshold.
+ * Exemplo:
+ *   zones[0] = { 10.0, kp=40,  ki=20, kd=150 }  → erro < 10m
+ *   zones[1] = { 40.0, kp=80,  ki=20, kd=250 }  → erro < 40m
+ *   zones[2] = { 999., kp=120, ki=20, kd=350 }  → erro >= 40m
+ */
+void pid_set_adaptive_gains(PIDController *pid,
+                            const GainZone *zones, int zone_count);
 
 /**
  * pid_reset - Zera o estado interno (integral e erro anterior).
@@ -40,11 +66,17 @@ void pid_init(PIDController *pid, double kp, double ki, double kd,
 void pid_reset(PIDController *pid);
 
 /**
- * pid_compute - Calcula a saída do controlador dado o setpoint e a medição atual.
+ * pid_compute - Calcula a saída do controlador.
  *
- * Retorna o valor de controle (ex: empuxo necessário).
- * Aplica anti-windup: o integral só acumula quando a saída não está saturada.
+ * Se ganhos adaptativos estiverem configurados, os ganhos são
+ * atualizados automaticamente com base no erro atual.
  */
 double pid_compute(PIDController *pid, double setpoint, double measurement);
+
+/**
+ * pid_get_active_zone - Retorna o índice da zona de ganho atualmente ativa.
+ * Útil para logging e debug. Retorna -1 se não houver zonas configuradas.
+ */
+int pid_get_active_zone(const PIDController *pid, double error);
 
 #endif /* PID_H */
