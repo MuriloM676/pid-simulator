@@ -20,6 +20,7 @@
 
 #include "pid.h"
 #include <math.h>
+#include <stddef.h>  /* NULL */
 
 /* Utilitário: restringe valor entre [lo, hi] */
 static double clamp(double value, double lo, double hi)
@@ -38,16 +39,17 @@ static double lerp(double a, double b, double t)
 void pid_init(PIDController *pid, double kp, double ki, double kd,
               double out_min, double out_max, double dt)
 {
-    pid->kp          = kp;
-    pid->ki          = ki;
-    pid->kd          = kd;
-    pid->out_min     = out_min;
-    pid->out_max     = out_max;
-    pid->dt          = dt;
-    pid->integral    = 0.0;
-    pid->prev_error  = 0.0;
-    pid->zones       = 0;
-    pid->zone_count  = 0;
+    pid->kp               = kp;
+    pid->ki               = ki;
+    pid->kd               = kd;
+    pid->out_min          = out_min;
+    pid->out_max          = out_max;
+    pid->dt               = dt;
+    pid->integral         = 0.0;
+    pid->prev_error       = 0.0;
+    pid->prev_measurement = 0.0;
+    pid->zones            = NULL;
+    pid->zone_count       = 0;
 }
 
 void pid_set_adaptive_gains(PIDController *pid,
@@ -59,8 +61,14 @@ void pid_set_adaptive_gains(PIDController *pid,
 
 void pid_reset(PIDController *pid)
 {
-    pid->integral   = 0.0;
-    pid->prev_error = 0.0;
+    pid->integral         = 0.0;
+    pid->prev_error       = 0.0;
+    pid->prev_measurement = 0.0;
+}
+
+void pid_decay_integral(PIDController *pid, double factor)
+{
+    pid->integral *= factor;
 }
 
 int pid_get_active_zone(const PIDController *pid, double error)
@@ -135,8 +143,10 @@ double pid_compute(PIDController *pid, double setpoint, double measurement)
     /* 4. Candidato a integral */
     double integral_candidate = pid->integral + pid->ki * error * pid->dt;
 
-    /* 5. Termo derivativo (sobre o erro) */
-    double d_term = pid->kd * (error - pid->prev_error) / pid->dt;
+    /* 5. Termo derivativo calculado sobre a MEDIÇÃO (não sobre o erro).
+     *    Evita "derivative kick" quando o setpoint muda bruscamente.
+     *    d(erro)/dt = -d(medição)/dt para setpoint constante → sinal negativo. */
+    double d_term = -pid->kd * (measurement - pid->prev_measurement) / pid->dt;
 
     /* 6. Saída bruta e saturada */
     double output_raw = p_term + integral_candidate + d_term;
@@ -152,8 +162,9 @@ double pid_compute(PIDController *pid, double setpoint, double measurement)
         pid->integral = integral_candidate;
     }
 
-    /* 8. Salva erro para próxima iteração */
-    pid->prev_error = error;
+    /* 8. Salva estado para próxima iteração */
+    pid->prev_error       = error;
+    pid->prev_measurement = measurement;
 
     return output;
 }

@@ -35,6 +35,7 @@ typedef struct {
     /* Estado interno */
     double integral;
     double prev_error;
+    double prev_measurement; /* Usado para D sobre medição (evita derivative kick) */
     double dt;
 
     /* Ganhos adaptativos */
@@ -61,15 +62,30 @@ void pid_set_adaptive_gains(PIDController *pid,
                             const GainZone *zones, int zone_count);
 
 /**
- * pid_reset - Zera o estado interno (integral e erro anterior).
+ * pid_reset - Zera o estado interno (integral e erros anteriores).
  */
 void pid_reset(PIDController *pid);
+
+/**
+ * pid_decay_integral - Aplica um decaimento exponencial à integral.
+ *
+ * Em vez de zerar abruptamente ao trocar de setpoint, reduz a integral
+ * por um fator (0 < factor < 1) a cada chamada, produzindo uma transição
+ * suave sem spike de empuxo.
+ *
+ * @factor : fração a manter por iteração (ex.: 0.5 = decai à metade)
+ */
+void pid_decay_integral(PIDController *pid, double factor);
 
 /**
  * pid_compute - Calcula a saída do controlador.
  *
  * Se ganhos adaptativos estiverem configurados, os ganhos são
  * atualizados automaticamente com base no erro atual.
+ *
+ * O termo derivativo é calculado sobre a MEDIÇÃO (não sobre o erro),
+ * evitando "derivative kick" em trocas bruscas de setpoint.
+ *   D = -Kd * (measurement - prev_measurement) / dt
  */
 double pid_compute(PIDController *pid, double setpoint, double measurement);
 

@@ -18,44 +18,7 @@
 #include <math.h>
 #include "pid.h"
 #include "aircraft.h"
-
-/* ------------------------------------------------------------------ */
-/* Constantes de simulação                                             */
-/* ------------------------------------------------------------------ */
-#define DT              0.01
-#define SIM_DURATION    40.0
-#define PRINT_EVERY     10          /* Log no terminal a cada 100 ms   */
-
-#define AIRCRAFT_MASS   500.0
-#define THRUST_MAX      10000.0
-#define THRUST_MIN      0.0
-#define INITIAL_ALT     0.0
-
-/* ------------------------------------------------------------------ */
-/* Ganhos adaptativos por zona de erro                                 */
-/*                                                                     */
-/* Zonas ordenadas do MENOR para o MAIOR threshold de erro:           */
-/*   SUAVE  : erro < 15m  → menos overshoot ao chegar no alvo        */
-/*   MÉDIO  : erro < 50m  → transição interpolada                     */
-/*   AGRESSIVO: erro >= 50m → subida/descida rápida                   */
-/*                                                                     */
-/* Ki é mantido constante entre zonas para não afetar o regime        */
-/* estacionário (eliminação de erro em regime permanente).            */
-/* ------------------------------------------------------------------ */
-#define PID_KI  20.0   /* Ki fixo em todas as zonas */
-
-#define SETPOINT_RATE_MAX   8.0     /* Rate limiter [m/s]              */
-#define LANDING_ALT         20.0    /* Altitude de ativação pouso [m]  */
-#define LANDING_VMAX        -2.0    /* Velocidade máx descida [m/s]    */
-
-#define CSV_PATH        "/tmp/pid_sim_data.csv"
-#define PNG_PATH        "simulation_result.png"
-
-/* ------------------------------------------------------------------ */
-/* Buffer de dados para o gráfico                                      */
-/* Armazena uma amostra a cada DT (10ms) → 4001 amostras em 40s      */
-/* ------------------------------------------------------------------ */
-#define MAX_SAMPLES     4002   /* (40.0 / 0.01) + 2 amostras   */
+#include "config.h"
 
 typedef struct {
     double t;
@@ -64,6 +27,7 @@ typedef struct {
     double setpoint;
     double velocity;
     double thrust;
+    int    fault;   /* 1 se leitura era de falha de sensor */
 } Sample;
 
 static Sample g_samples[MAX_SAMPLES];
@@ -81,9 +45,6 @@ static const SetpointEvent SETPOINT_SCHEDULE[] = {
 };
 #define SETPOINT_COUNT (int)(sizeof(SETPOINT_SCHEDULE)/sizeof(SETPOINT_SCHEDULE[0]))
 
-#define FAULT_START  14.0
-#define FAULT_END    16.0
-#define FAULT_VALUE  999.0
 
 /* ------------------------------------------------------------------ */
 /* Funções auxiliares                                                  */
@@ -91,12 +52,11 @@ static const SetpointEvent SETPOINT_SCHEDULE[] = {
 
 static double get_setpoint(double t)
 {
-    double sp = SETPOINT_SCHEDULE[0].setpoint;
     int i;
-    for (i = 0; i < SETPOINT_COUNT; i++)
+    for (i = SETPOINT_COUNT - 1; i >= 0; i--)
         if (t >= SETPOINT_SCHEDULE[i].time)
-            sp = SETPOINT_SCHEDULE[i].setpoint;
-    return sp;
+            return SETPOINT_SCHEDULE[i].setpoint;
+    return SETPOINT_SCHEDULE[0].setpoint;
 }
 
 static double apply_rate_limiter(double current, double target, double dt)
@@ -108,9 +68,13 @@ static double apply_rate_limiter(double current, double target, double dt)
     return target;
 }
 
-static double apply_landing_mode(double sp, double altitude, double velocity)
+static double apply_landing_mode(double sp, double altitude, double velocity,
+                                 double target_sp)
 {
-    if (altitude < LANDING_ALT && velocity < LANDING_VMAX) {
+    /* Não ativa modo de pouso se o setpoint-alvo já é baixo (<=LANDING_ALT),
+     * pois isso indicaria uma descida intencional e controlada. */
+    if (target_sp > LANDING_ALT &&
+        altitude < LANDING_ALT && velocity < LANDING_VMAX) {
         double excess_speed = velocity - LANDING_VMAX;
         double brake_offset = -excess_speed * 3.0;
         return altitude + brake_offset;
@@ -175,7 +139,7 @@ static int export_csv(void)
     for (i = 0; i < g_sample_count; i++) {
         /* Oculta leituras de falha do sensor no CSV para não distorcer o gráfico
          * (substituído pelo valor real para plotagem correta) */
-        double sensor_plot = (g_samples[i].sensor > 500.0)
+        double sensor_plot = g_samples[i].fault
                              ? g_samples[i].altitude   /* falha: usa real */
                              : g_samples[i].sensor;
 
@@ -256,6 +220,7 @@ static void send_plot_commands(FILE *gp)
 static void plot_gnuplot(void)
 {
     FILE *gp;
+    int   status;
 
     /* ── 1. Salva PNG na raiz do projeto ── */
     gp = popen("gnuplot", "w");
@@ -267,16 +232,22 @@ static void plot_gnuplot(void)
     fprintf(gp, "set output '%s'\n", PNG_PATH);
     send_plot_commands(gp);
     fprintf(gp, "set output\n");   /* flush e fecha o arquivo */
-    pclose(gp);
-    printf("\nImagem salva em: %s\n", PNG_PATH);
+    status = pclose(gp);
+    if (status != 0)
+        fprintf(stderr, "Aviso: gnuplot (PNG) encerrou com status %d\n", status);
+    else
+        printf("\nImagem salva em: %s\n", PNG_PATH);
 
     /* ── 2. Abre janela interativa ── */
     gp = popen("gnuplot -persistent", "w");
     if (!gp) return;
     fprintf(gp, "set terminal qt size 1100,750 title 'PID - Simulador de Altitude'\n");
     send_plot_commands(gp);
-    pclose(gp);
-    printf("Gráfico interativo aberto!\n");
+    status = pclose(gp);
+    if (status != 0)
+        fprintf(stderr, "Aviso: gnuplot (interativo) encerrou com status %d\n", status);
+    else
+        printf("Gráfico interativo aberto!\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -293,25 +264,15 @@ int main(void)
 
     PIDController pid;
 
-    /* Tabela de zonas de ganho adaptativo
-     * Cada entrada: { error_threshold, kp, ki, kd }
-     * Os ganhos são INTERPOLADOS entre zonas para transição suave.  */
-    /* Zonas de ganho adaptativo:
-     *
+    /* Zonas de ganho adaptativo definidas em config.h.
      * Filosofia:
-     *   - Longe do alvo (erro > 40m): Kp alto + Kd moderado → subida rápida
-     *   - Perto do alvo (erro < 15m): Kp baixo + Kd muito alto → freia forte
-     *                                  antes de ultrapassar o alvo
-     *   - A interpolação suaviza a transição → sem saltos no empuxo
-     *
-     * O Kd alto na zona suave compensa o limite físico do empuxo mínimo = 0N:
-     * como não temos empuxo negativo, o amortecimento derivativo é a única
-     * forma de frear a aeronave quando ela se aproxima do alvo com velocidade
-     * positiva.                                                              */
+     *   - Longe do alvo (erro > 50m): Kp alto + Kd moderado  -> subida rápida
+     *   - Perto do alvo (erro < 15m): Kp baixo + Kd muito alto -> freia forte
+     *   - Interpolação suaviza a transição -> sem saltos no empuxo           */
     static const GainZone zones[] = {
-        {  15.0,  60.0, PID_KI, 600.0 },  /* SUAVE:     erro < 15m  */
-        {  50.0,  90.0, PID_KI, 450.0 },  /* MÉDIO:     erro < 50m  */
-        { 999.0, 120.0, PID_KI, 350.0 },  /* AGRESSIVO: erro >= 50m */
+        PID_ZONE_SOFT,   /* SUAVE:     erro < 15m  */
+        PID_ZONE_MID,    /* MÉDIO:     erro < 50m  */
+        PID_ZONE_AGG,    /* AGRESSIVO: erro >= 50m */
     };
 
     pid_init(&pid, 120.0, PID_KI, 350.0, THRUST_MIN, THRUST_MAX, DT);
@@ -331,6 +292,8 @@ int main(void)
     double target_sp      = get_setpoint(0.0);
     double ramp_sp        = get_setpoint(0.0);
     double prev_target_sp = target_sp;
+    int    sp_change_steps = 0;  /* Conta iterações após troca de setpoint */
+
 
     for (step = 0; step <= total_steps; step++) {
         t = step * DT;
@@ -344,10 +307,15 @@ int main(void)
         /* 3. Setpoint alvo */
         target_sp = get_setpoint(t);
 
-        /* 4. Reset do integrador na troca de setpoint */
+        /* 4. Fade-out suave do integrador na troca de setpoint.
+         *    Evita spike de empuxo sem zerar abruptamente o acúmulo I. */
         if (target_sp != prev_target_sp) {
-            pid_reset(&pid);
-            prev_target_sp = target_sp;
+            sp_change_steps = INTEGRAL_DECAY_STEPS;
+            prev_target_sp  = target_sp;
+        }
+        if (sp_change_steps > 0) {
+            pid_decay_integral(&pid, INTEGRAL_DECAY_FACTOR);
+            sp_change_steps--;
         }
 
         /* 5. Rate limiter */
@@ -355,7 +323,7 @@ int main(void)
 
         /* 6. Modo pouso suave */
         double pid_sp = apply_landing_mode(ramp_sp, aircraft.altitude,
-                                           aircraft.velocity);
+                                           aircraft.velocity, target_sp);
 
         /* 7. PID */
         double thrust = pid_compute(&pid, pid_sp, alt_measured);
@@ -371,6 +339,7 @@ int main(void)
             g_samples[g_sample_count].setpoint = pid_sp;
             g_samples[g_sample_count].velocity = aircraft.velocity;
             g_samples[g_sample_count].thrust   = aircraft.thrust;
+            g_samples[g_sample_count].fault    = sensor.fault_active;
             g_sample_count++;
         }
 

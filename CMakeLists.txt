@@ -9,4 +9,12 @@ add_executable(altitude_sim
     aircraft.c
 )
 
+target_compile_options(altitude_sim PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wno-unused-result   # popen/pclose já tratados explicitamente
+)
+
 target_link_libraries(altitude_sim m)
+
